@@ -690,6 +690,7 @@ void Application::Start() {
 
 void Application::OnClockTimer() {
     clock_ticks_++;
+    vTaskPrioritySet(NULL, 1);
 
     auto display = Board::GetInstance().GetDisplay();
     display->UpdateStatusBar();

@@ -6,6 +6,7 @@
 #include "config.h"
 #include "i2c_device.h"
 #include "iot/thing_manager.h"
+#include "mcp_server.h"
 #include "esp32_camera.h"
 
 #include <esp_log.h>
@@ -16,6 +17,7 @@
 #include <esp_lcd_touch_ft5x06.h>
 #include <esp_lvgl_port.h>
 #include <lvgl.h>
+#include <thread>
 
 
 #define TAG "LichuangDevBoard"
@@ -29,7 +31,7 @@ public:
         WriteReg(0x01, 0x03);
         WriteReg(0x03, 0xf8);
     }
-
+    
     void SetOutputState(uint8_t bit, uint8_t level) {
         uint8_t data = ReadReg(0x01);
         data = (data & ~(1 << bit)) | (level << bit);
@@ -68,14 +70,129 @@ public:
     }
 };
 
+/**
+ * @brief PCF8575 I/O 扩展芯片，地址为 0x20。
+ */
+class Pcf8575 : public I2cDevice {
+private:
+    uint16_t data_ = 0xffff;
+    bool initialized_ = false;
+
+public:
+    Pcf8575(i2c_master_bus_handle_t i2c_bus, uint8_t addr) : I2cDevice(i2c_bus, addr) {
+        // 复位所有位
+        if (i2c_master_transmit(i2c_device_, (uint8_t*)&data_, 2, 100) != ESP_OK) {
+            initialized_ = false;
+        } else {
+            initialized_ = true;
+        }
+    }
+
+    void SetBit(uint8_t bit, uint8_t level) {
+        if (initialized_) {
+            data_ = (data_ & ~(1 << bit)) | (level << bit);
+            ESP_ERROR_CHECK_WITHOUT_ABORT(i2c_master_transmit(i2c_device_, (uint8_t*)&data_, 2, 100));
+        }
+    }
+
+    bool IsInitialized() const {
+        return initialized_;
+    }
+};
+
 class LichuangDevBoard : public WifiBoard {
 private:
     i2c_master_bus_handle_t i2c_bus_;
     i2c_master_dev_handle_t pca9557_handle_;
     Button boot_button_;
     LcdDisplay* display_;
-    Pca9557* pca9557_;
+    Pca9557* pca9557_ = nullptr;
+    Pcf8575* pcf8575_ = nullptr;
     Esp32Camera* camera_;
+    bool bed_operating_ = false;
+
+    /**
+     * @brief 控制床的某个功能
+     * @param bit 要控制的位
+     * @param duration_ms 持续时间，单位毫秒
+     * @return 返回值
+     */
+    ReturnValue ControlBed(int bit, int duration_ms = 12000) {
+        if (bed_operating_) {
+            throw std::runtime_error("Bed is already operating");
+        }
+
+        ESP_LOGI(TAG, "ControlBed(%d, %d)", bit, duration_ms);
+        bed_operating_ = true;
+        std::thread([this, bit, duration_ms]() {
+            // 低电平
+            pcf8575_->SetBit(bit, 0);
+            // 持续 duration_ms 毫秒
+            int count = duration_ms / 100;
+            for (int i = 0; i < count && bed_operating_; i++) {
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
+            // 高电平
+            pcf8575_->SetBit(bit, 1);
+            bed_operating_ = false;
+        }).detach();
+
+        return "{\"success\": true, \"message\": \"Bed is operating now\"}";
+    }
+
+    void InitializeTools() {
+        // 初始化工具
+        auto& mcp_server = McpServer::GetInstance();
+        mcp_server.AddTool("bed.adjust", "床位调整\n"
+            "Args: \n"
+            "   action: 动作，支持以下动作：raise_back（升高靠背），lower_back（降低靠背），raise_leg（升高腿部），lower_leg（降低腿部），lean_left（靠左倾斜），lean_right（靠右倾斜）\n"
+            "   full_adjust: 是否完整调整（持续12秒），否则持续2秒\n",
+            PropertyList({
+                Property("action", kPropertyTypeString),
+                Property("full_adjust", kPropertyTypeBoolean, false),
+            }), [this](const PropertyList& properties) -> ReturnValue {
+                auto action = properties["action"].value<std::string>();
+                auto full_adjust = properties["full_adjust"].value<bool>();
+                int duration_ms = 2000;
+                if (full_adjust) {
+                    duration_ms = 12000;
+                }
+                if (action == "raise_back") {
+                    return ControlBed(0, duration_ms);
+                } else if (action == "lower_back") {
+                    return ControlBed(1, duration_ms);
+                } else if (action == "raise_leg") {
+                    return ControlBed(2, duration_ms);
+                } else if (action == "lower_leg") {
+                    return ControlBed(3, duration_ms);
+                } else if (action == "lean_left") {
+                    return ControlBed(4, duration_ms);
+                } else if (action == "lean_right") {
+                    return ControlBed(5, duration_ms);
+                } else {
+                    throw std::runtime_error("Invalid action: " + action);
+                }
+            });
+        mcp_server.AddTool("bed.open_toilet", "便盆打开", PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+            return ControlBed(6);
+        });
+        mcp_server.AddTool("bed.close_toilet", "便盆关闭", PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+            return ControlBed(7);
+        });
+        mcp_server.AddTool("bed.auto_flip_a", "自动翻身A", PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+            return ControlBed(8);
+        });
+        mcp_server.AddTool("bed.auto_flip_b", "自动翻身B", PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+            return ControlBed(9);
+        });
+        mcp_server.AddTool("bed.cancel_operation", "取消操作。如用户提出暂停或取消当前操作，应先调用后回答", PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+            if (!bed_operating_) {
+                return "{\"success\": false, \"message\": \"No operation is in progress\"}";
+            }
+            bed_operating_ = false;
+            return "{\"success\": true, \"message\": \"Operation cancelled\"}";
+        });
+    }
 
     void InitializeI2c() {
         // Initialize I2C peripheral
@@ -95,6 +212,7 @@ private:
 
         // Initialize PCA9557
         pca9557_ = new Pca9557(i2c_bus_, 0x19);
+        pcf8575_ = new Pcf8575(i2c_bus_, 0x20);
     }
 
     void InitializeSpi() {
@@ -248,6 +366,9 @@ public:
         InitializeTouch();
         InitializeButtons();
         InitializeCamera();
+        if (pcf8575_->IsInitialized()) {
+            InitializeTools();
+        }
 
 #if CONFIG_IOT_PROTOCOL_XIAOZHI
         auto& thing_manager = iot::ThingManager::GetInstance();
